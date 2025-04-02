@@ -1,0 +1,548 @@
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import time
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+import io  # Add this import for StringIO
+
+class TrumpHPOSAnalyzer:
+    def __init__(self):
+        self.api_url = "https://api.hyperliquid.xyz/info"
+        self.tokens = self.get_all_tokens()
+        self.high_rates_threshold = 0.1  # 0.1% threshold for high rates
+        
+    def get_all_tokens(self) -> List[str]:
+        """Get list of all available tokens on Hyperliquid"""
+        try:
+            payload = {"type": "meta"}
+            response = requests.post(self.api_url, json=payload)
+            meta_data = response.json()
+            tokens = [coin['name'] for coin in meta_data['universe']]
+            print(f"\nFound {len(tokens)} tokens on Hyperliquid:")
+            print(", ".join(tokens))
+            return tokens
+        except Exception as e:
+            print(f"Error getting token list: {e}")
+            return ["HPOS"]  # Return default token if API fails
+            
+    def get_token_launch_time(self, token: str) -> Optional[int]:
+        """Get the launch timestamp for a token by finding earliest funding rate"""
+        try:
+            # Start from a very early date to ensure we catch the launch
+            early_start = int(datetime(2023, 1, 1).timestamp() * 1000)
+            
+            payload = {
+                "type": "fundingHistory",
+                "coin": token,
+                "startTime": early_start
+            }
+            response = requests.post(self.api_url, json=payload)
+            history = response.json()
+            
+            if history and len(history) > 0:
+                # Sort by timestamp to get the earliest entry
+                sorted_history = sorted(history, key=lambda x: int(x['time']))
+                launch_time = int(sorted_history[0]['time'])
+                launch_dt = datetime.fromtimestamp(launch_time/1000)
+                print(f"\n{token} launch detected at: {launch_dt}")
+                return launch_time
+            return None
+            
+        except Exception as e:
+            print(f"Error getting launch time for {token}: {e}")
+            return None
+
+    def get_extended_funding_data(self, token: str) -> Tuple[List[float], List[datetime]]:
+        """Get all funding rate samples from launch until now"""
+        try:
+            all_rates = []
+            all_timestamps = []
+            
+            # Get launch time first
+            launch_time = self.get_token_launch_time(token)
+            if not launch_time:
+                print(f"Could not determine launch time for {token}")
+                return [], []
+            
+            current_time = int(time.time() * 1000)
+            chunk_size = 500 * 3600 * 1000  # 500 hours in milliseconds
+            
+            # Calculate number of chunks needed
+            total_time_span = current_time - launch_time
+            num_chunks = (total_time_span + chunk_size - 1) // chunk_size  # Round up division
+            
+            print(f"\nFetching all samples for {token} since launch...")
+            print(f"Time span: {datetime.fromtimestamp(launch_time/1000)} to {datetime.fromtimestamp(current_time/1000)}")
+            print(f"Estimated chunks needed: {num_chunks}")
+            
+            # Fetch data in chunks
+            chunk_end = current_time
+            all_history = []
+            
+            while chunk_end > launch_time:
+                chunk_start = max(chunk_end - chunk_size, launch_time)
+                
+                print(f"\nFetching chunk from "
+                      f"{datetime.fromtimestamp(chunk_start/1000).strftime('%Y-%m-%d %H:%M')} to "
+                      f"{datetime.fromtimestamp(chunk_end/1000).strftime('%Y-%m-%d %H:%M')}")
+                
+                payload = {
+                    "type": "fundingHistory",
+                    "coin": token,
+                    "startTime": chunk_start
+                }
+                response = requests.post(self.api_url, json=payload)
+                chunk_history = response.json()
+                all_history.extend(chunk_history)
+                
+                chunk_end = chunk_start
+                time.sleep(0.5)  # Add small delay between requests
+            
+            # Remove duplicates and sort by timestamp
+            seen_timestamps = set()
+            unique_history = []
+            
+            for entry in all_history:
+                timestamp = int(entry['time'])
+                if timestamp not in seen_timestamps:
+                    seen_timestamps.add(timestamp)
+                    unique_history.append(entry)
+            
+            sorted_history = sorted(unique_history, key=lambda x: int(x['time']))
+            
+            # Extract rates and timestamps
+            for entry in sorted_history:
+                timestamp = int(entry['time'])
+                funding_rate = float(entry['fundingRate'])
+                all_rates.append(funding_rate)
+                all_timestamps.append(datetime.fromtimestamp(timestamp/1000))
+            
+            print(f"\nTotal unique samples collected for {token}: {len(all_rates)}")
+            print(f"Date range: from {all_timestamps[0]} to {all_timestamps[-1]}")
+            print(f"Total days of data: {(all_timestamps[-1] - all_timestamps[0]).days}")
+            
+            return all_rates, all_timestamps
+            
+        except Exception as e:
+            print(f"Error getting funding data for {token}: {e}")
+            return [], []
+
+    def analyze_high_rates(self, rates: List[float], timestamps: List[datetime], token: str) -> Dict:
+        """Analyze occurrences of high funding rates"""
+        rates_array = np.array(rates) * 100  # Convert to percentage
+        high_rates_mask = rates_array > self.high_rates_threshold
+        high_rates_indices = np.where(high_rates_mask)[0]
+        
+        high_rates_data = []
+        for idx in high_rates_indices:
+            high_rates_data.append({
+                'timestamp': timestamps[idx],
+                'rate': rates_array[idx]
+            })
+        
+        return {
+            'count': len(high_rates_indices),
+            'percentage': (len(high_rates_indices) / len(rates)) * 100,
+            'max_rate': np.max(rates_array),
+            'high_rates': sorted(high_rates_data, key=lambda x: x['rate'], reverse=True)
+        }
+
+    def calculate_persistence(self, rates: List[float]) -> Tuple[float, float]:
+        """Calculate average length of consecutive positive and negative rate periods"""
+        rates_array = np.array(rates) * 100  # Convert to percentage
+        
+        # Calculate positive persistence
+        pos_current_streak = 0
+        pos_streaks = []
+        
+        # Calculate negative persistence
+        neg_current_streak = 0
+        neg_streaks = []
+        
+        for rate in rates_array:
+            if rate > 0:
+                pos_current_streak += 1
+                if neg_current_streak > 0:
+                    neg_streaks.append(neg_current_streak)
+                    neg_current_streak = 0
+            else:
+                neg_current_streak += 1
+                if pos_current_streak > 0:
+                    pos_streaks.append(pos_current_streak)
+                    pos_current_streak = 0
+        
+        # Don't forget the last streak
+        if pos_current_streak > 0:
+            pos_streaks.append(pos_current_streak)
+        if neg_current_streak > 0:
+            neg_streaks.append(neg_current_streak)
+            
+        pos_persistence = np.mean(pos_streaks) if pos_streaks else 0
+        neg_persistence = np.mean(neg_streaks) if neg_streaks else 0
+        
+        return pos_persistence, neg_persistence
+
+    def calculate_autocorrelation(self, rates: List[float], max_lag: int = 24) -> pd.DataFrame:
+        """Calculate autocorrelation up to max_lag hours"""
+        rates_array = np.array(rates) * 100
+        autocorr = []
+        rates_series = pd.Series(rates_array)
+        
+        for lag in range(1, max_lag + 1):
+            corr = rates_series.autocorr(lag=lag)
+            autocorr.append({'lag': lag, 'correlation': corr})
+            
+        return pd.DataFrame(autocorr)
+
+    def create_analysis_plots(self, token: str, rates: List[float], timestamps: List[datetime], 
+                            launch_time: int, high_rates_data: Dict):
+        """Create comprehensive analysis plots"""
+        rates_array = np.array(rates) * 100  # Convert to percentage
+        positive_rates = rates_array[rates_array > 0]
+        
+        # Get last 500 samples
+        last_500_rates = rates_array[-500:] if len(rates_array) >= 500 else rates_array
+        last_500_timestamps = timestamps[-500:] if len(timestamps) >= 500 else timestamps
+        last_500_positive_rates = last_500_rates[last_500_rates > 0]
+        
+        # Calculate optimal number of bins using Freedman-Diaconis rule
+        def get_optimal_bins(data):
+            iqr = np.percentile(data, 75) - np.percentile(data, 25)
+            bin_width = 2 * iqr / (len(data) ** (1/3))
+            n_bins = int((np.max(data) - np.min(data)) / bin_width) if bin_width > 0 else 50
+            return min(max(n_bins, 50), 100)  # Between 50 and 100 bins
+        
+        full_bins = get_optimal_bins(rates_array)
+        pos_bins = get_optimal_bins(positive_rates) if len(positive_rates) > 0 else 50
+        last_500_bins = get_optimal_bins(last_500_rates)
+        last_500_pos_bins = get_optimal_bins(last_500_positive_rates) if len(last_500_positive_rates) > 0 else 50
+        
+        # Create figure with multiple subplots
+        plt.figure(figsize=(20, 30))  # Made taller to accommodate more plots
+        
+        # === Full History Plots ===
+        
+        # 1. Full time series with high rates highlighted
+        plt.subplot(6, 1, 1)
+        plt.plot(timestamps, rates_array, label='Funding Rate', alpha=0.7)
+        
+        # Highlight high rates
+        high_rates_mask = rates_array > self.high_rates_threshold
+        plt.scatter(np.array(timestamps)[high_rates_mask], 
+                   rates_array[high_rates_mask],
+                   color='red', alpha=0.5, label=f'Rates > {self.high_rates_threshold}%')
+        
+        plt.title(f'{token} Funding Rates Since Launch')
+        plt.xlabel('Date')
+        plt.ylabel('Funding Rate (%)')
+        plt.legend()
+        plt.grid(True)
+        
+        # 2. Full history distribution with percentiles
+        plt.subplot(6, 1, 2)
+        sns.histplot(rates_array, bins=full_bins, kde=True)
+        percentiles = np.percentile(rates_array, [1, 5, 25, 50, 75, 95, 99])
+        for p, pct in zip(percentiles, [1, 5, 25, 50, 75, 95, 99]):
+            plt.axvline(p, color='r', linestyle='--', alpha=0.5,
+                       label=f'{pct}th: {p:.4f}%')
+        plt.title('Full History - Funding Rate Distribution')
+        plt.xlabel('Funding Rate (%)')
+        plt.legend(fontsize='small')
+        
+        # 3. Full history positive rates distribution
+        plt.subplot(6, 1, 3)
+        if len(positive_rates) > 0:
+            sns.histplot(positive_rates, bins=pos_bins, kde=True)
+            pos_percentiles = np.percentile(positive_rates, [25, 50, 75, 95])
+            for p, pct in zip(pos_percentiles, [25, 50, 75, 95]):
+                plt.axvline(p, color='g', linestyle='--', alpha=0.5,
+                           label=f'{pct}th: {p:.4f}%')
+        plt.title('Full History - Positive Rates Distribution')
+        plt.xlabel('Funding Rate (%)')
+        plt.legend(fontsize='small')
+        
+        # === Last 500 Samples Plots ===
+        
+        # 4. Last 500 samples time series
+        plt.subplot(6, 1, 4)
+        plt.plot(last_500_timestamps, last_500_rates, label='Funding Rate', alpha=0.7)
+        
+        # Highlight high rates in last 500
+        last_500_high_mask = last_500_rates > self.high_rates_threshold
+        plt.scatter(np.array(last_500_timestamps)[last_500_high_mask], 
+                   last_500_rates[last_500_high_mask],
+                   color='red', alpha=0.5, label=f'Rates > {self.high_rates_threshold}%')
+        
+        plt.title(f'{token} Last 500 Funding Rates')
+        plt.xlabel('Date')
+        plt.ylabel('Funding Rate (%)')
+        plt.legend()
+        plt.grid(True)
+        
+        # 5. Last 500 samples distribution
+        plt.subplot(6, 1, 5)
+        sns.histplot(last_500_rates, bins=last_500_bins, kde=True)
+        last_500_percentiles = np.percentile(last_500_rates, [1, 5, 25, 50, 75, 95, 99])
+        for p, pct in zip(last_500_percentiles, [1, 5, 25, 50, 75, 95, 99]):
+            plt.axvline(p, color='r', linestyle='--', alpha=0.5,
+                       label=f'{pct}th: {p:.4f}%')
+        plt.title('Last 500 Samples - Funding Rate Distribution')
+        plt.xlabel('Funding Rate (%)')
+        plt.legend(fontsize='small')
+        
+        # 6. Last 500 samples positive rates distribution
+        plt.subplot(6, 1, 6)
+        if len(last_500_positive_rates) > 0:
+            sns.histplot(last_500_positive_rates, bins=last_500_pos_bins, kde=True)
+            last_500_pos_percentiles = np.percentile(last_500_positive_rates, [25, 50, 75, 95])
+            for p, pct in zip(last_500_pos_percentiles, [25, 50, 75, 95]):
+                plt.axvline(p, color='g', linestyle='--', alpha=0.5,
+                           label=f'{pct}th: {p:.4f}%')
+        plt.title('Last 500 Samples - Positive Rates Distribution')
+        plt.xlabel('Funding Rate (%)')
+        plt.legend(fontsize='small')
+        
+        plt.tight_layout()
+        plt.savefig(f'{token.lower()}_detailed_analysis.png')
+        plt.close()
+
+    def analyze_token(self, token: str) -> Tuple[Dict, Dict]:
+        """Perform comprehensive analysis for a single token and return stats dictionaries"""
+        # Get launch time
+        launch_time = self.get_token_launch_time(token)
+        if not launch_time:
+            print(f"Could not determine launch time for {token}")
+            return {}, {}
+        
+        # Get extended funding data
+        rates, timestamps = self.get_extended_funding_data(token)
+        if not rates:
+            print(f"No funding data available for {token}")
+            return {}, {}
+        
+        # Analyze high rates
+        high_rates_data = self.analyze_high_rates(rates, timestamps, token)
+        
+        # Calculate persistence
+        pos_persistence, neg_persistence = self.calculate_persistence(rates)
+        
+        # Convert to numpy array and calculate statistics
+        rates_array = np.array(rates) * 100  # Convert to percentage
+        positive_rates = rates_array[rates_array > 0]
+        negative_rates = rates_array[rates_array < 0]
+        
+        # Get last 500 samples
+        last_500_rates = rates_array[-500:] if len(rates_array) >= 500 else rates_array
+        last_500_timestamps = timestamps[-500:] if len(timestamps) >= 500 else timestamps
+        last_500_positive = last_500_rates[last_500_rates > 0]
+        last_500_negative = last_500_rates[last_500_rates < 0]
+        
+        # Calculate last 500 persistence
+        last_500_pos_persistence, last_500_neg_persistence = self.calculate_persistence(last_500_rates/100)  # Convert back to decimal
+        
+        # Calculate last 500 high rates
+        last_500_high_rates = self.analyze_high_rates(
+            [r/100 for r in last_500_rates],  # Convert back to decimal
+            last_500_timestamps,
+            token
+        )
+        
+        # Create visualizations
+        self.create_analysis_plots(token, rates, timestamps, launch_time, high_rates_data)
+        
+        # Full history statistics
+        full_history_stats = {
+            'Token': token,
+            'Launch Date': datetime.fromtimestamp(launch_time/1000),
+            'Total Samples': len(rates),
+            'Date Range Start': timestamps[0],
+            'Date Range End': timestamps[-1],
+            'Mean Rate (%)': np.mean(rates_array),
+            'Median Rate (%)': np.median(rates_array),
+            'Standard Deviation (%)': np.std(rates_array),
+            'Max Rate (%)': np.max(rates_array),
+            'Min Rate (%)': np.min(rates_array),
+            'Positive Rate %': (len(positive_rates) / len(rates_array)) * 100,
+            'Mean Positive Rate (%)': np.mean(positive_rates) if len(positive_rates) > 0 else 0,
+            'Mean Negative Rate (%)': np.mean(negative_rates) if len(negative_rates) > 0 else 0,
+            'Average Positive Persistence (hours)': pos_persistence,
+            'Average Negative Persistence (hours)': neg_persistence,
+            'High Rates Count': high_rates_data['count'],
+            'High Rates %': high_rates_data['percentage'],
+            'Highest Rate (%)': high_rates_data['max_rate']
+        }
+        
+        # Last 500 samples statistics
+        last_500_stats = {
+            'Token': token,
+            'Sample Size': len(last_500_rates),
+            'Date Range Start': last_500_timestamps[0],
+            'Date Range End': last_500_timestamps[-1],
+            'Mean Rate (%)': np.mean(last_500_rates),
+            'Median Rate (%)': np.median(last_500_rates),
+            'Standard Deviation (%)': np.std(last_500_rates),
+            'Max Rate (%)': np.max(last_500_rates),
+            'Min Rate (%)': np.min(last_500_rates),
+            'Positive Rate %': (len(last_500_positive) / len(last_500_rates)) * 100,
+            'Mean Positive Rate (%)': np.mean(last_500_positive) if len(last_500_positive) > 0 else 0,
+            'Mean Negative Rate (%)': np.mean(last_500_negative) if len(last_500_negative) > 0 else 0,
+            'Average Positive Persistence (hours)': last_500_pos_persistence,
+            'Average Negative Persistence (hours)': last_500_neg_persistence,
+            'High Rates Count': last_500_high_rates['count'],
+            'High Rates %': last_500_high_rates['percentage'],
+            'Highest Rate (%)': last_500_high_rates['max_rate']
+        }
+        
+        # Create string buffers to capture terminal output
+        full_history_output = []
+        last_500_output = []
+        
+        # Print full history analysis and capture to buffer
+        full_history_output.append(f"=== {token} Full History Analysis ===")
+        full_history_output.append(f"Launch Date: {full_history_stats['Launch Date']}")
+        full_history_output.append(f"Total Samples: {full_history_stats['Total Samples']}")
+        full_history_output.append(f"Date Range: {full_history_stats['Date Range Start']} to {full_history_stats['Date Range End']}")
+        full_history_output.append(f"\nFunding Rate Statistics:")
+        full_history_output.append(f"Mean Rate: {full_history_stats['Mean Rate (%)']:.4f}%")
+        full_history_output.append(f"Median Rate: {full_history_stats['Median Rate (%)']:.4f}%")
+        full_history_output.append(f"Standard Deviation: {full_history_stats['Standard Deviation (%)']:.4f}%")
+        full_history_output.append(f"Max Rate: {full_history_stats['Max Rate (%)']:.4f}%")
+        full_history_output.append(f"Min Rate: {full_history_stats['Min Rate (%)']:.4f}%")
+        full_history_output.append(f"Positive Rate %: {full_history_stats['Positive Rate %']:.1f}%")
+        full_history_output.append(f"Mean Positive Rate: {full_history_stats['Mean Positive Rate (%)']:.4f}%")
+        full_history_output.append(f"Mean Negative Rate: {full_history_stats['Mean Negative Rate (%)']:.4f}%")
+        full_history_output.append(f"Average Positive Persistence: {full_history_stats['Average Positive Persistence (hours)']:.1f} hours")
+        full_history_output.append(f"Average Negative Persistence: {full_history_stats['Average Negative Persistence (hours)']:.1f} hours")
+        
+        full_history_output.append(f"\nHigh Rates Analysis (>{self.high_rates_threshold}%):")
+        full_history_output.append(f"Total Occurrences: {full_history_stats['High Rates Count']}")
+        full_history_output.append(f"Percentage of Time: {full_history_stats['High Rates %']:.2f}%")
+        full_history_output.append(f"Highest Rate: {full_history_stats['Highest Rate (%)']:.4f}%")
+        
+        # Print last 500 samples analysis and capture to buffer
+        last_500_output.append(f"=== {token} Last 500 Samples Analysis ===")
+        last_500_output.append(f"Sample Size: {last_500_stats['Sample Size']}")
+        last_500_output.append(f"Date Range: {last_500_stats['Date Range Start']} to {last_500_stats['Date Range End']}")
+        last_500_output.append(f"\nFunding Rate Statistics:")
+        last_500_output.append(f"Mean Rate: {last_500_stats['Mean Rate (%)']:.4f}%")
+        last_500_output.append(f"Median Rate: {last_500_stats['Median Rate (%)']:.4f}%")
+        last_500_output.append(f"Standard Deviation: {last_500_stats['Standard Deviation (%)']:.4f}%")
+        last_500_output.append(f"Max Rate: {last_500_stats['Max Rate (%)']:.4f}%")
+        last_500_output.append(f"Min Rate: {last_500_stats['Min Rate (%)']:.4f}%")
+        last_500_output.append(f"Positive Rate %: {last_500_stats['Positive Rate %']:.1f}%")
+        last_500_output.append(f"Mean Positive Rate: {last_500_stats['Mean Positive Rate (%)']:.4f}%")
+        last_500_output.append(f"Mean Negative Rate: {last_500_stats['Mean Negative Rate (%)']:.4f}%")
+        last_500_output.append(f"Average Positive Persistence: {last_500_stats['Average Positive Persistence (hours)']:.1f} hours")
+        last_500_output.append(f"Average Negative Persistence: {last_500_stats['Average Negative Persistence (hours)']:.1f} hours")
+        
+        last_500_output.append(f"\nHigh Rates Analysis (>{self.high_rates_threshold}%):")
+        last_500_output.append(f"Total Occurrences: {last_500_stats['High Rates Count']}")
+        last_500_output.append(f"Percentage of Time: {last_500_stats['High Rates %']:.2f}%")
+        last_500_output.append(f"Highest Rate: {last_500_stats['Highest Rate (%)']:.4f}%")
+        
+        # Print high rates data
+        print("\n".join(full_history_output))
+        print("\n".join(last_500_output))
+        
+        # Top 10 highest rates for full history
+        full_history_output.append("\nTop 10 Highest Rates (Full History):")
+        print("\nTop 10 Highest Rates (Full History):")
+        for i, data in enumerate(high_rates_data['high_rates'][:10], 1):
+            rate_info = f"{i}. {data['timestamp']}: {data['rate']:.4f}%"
+            full_history_output.append(rate_info)
+            print(rate_info)
+        
+        # Top 10 highest rates for last 500 samples
+        last_500_output.append("\nTop 10 Highest Rates (Last 500 Samples):")
+        print("\nTop 10 Highest Rates (Last 500 Samples):")
+        for i, data in enumerate(last_500_high_rates['high_rates'][:10], 1):
+            rate_info = f"{i}. {data['timestamp']}: {data['rate']:.4f}%"
+            last_500_output.append(rate_info)
+            print(rate_info)
+        
+        # Save terminal output to CSV files
+        self.save_terminal_output_to_csv(token, full_history_output, "full_history")
+        self.save_terminal_output_to_csv(token, last_500_output, "last_500")
+        
+        # Return the stats dictionaries instead of saving individual CSVs
+        return full_history_stats, last_500_stats
+    
+    def save_terminal_output_to_csv(self, token: str, output_lines: List[str], time_range: str):
+        """Save terminal output to a CSV file"""
+        # Create a dataframe from the output lines
+        data = []
+        current_section = "General"
+        
+        for line in output_lines:
+            if line.startswith("==="):
+                continue  # Skip section headers
+            elif line.strip() == "":
+                continue  # Skip empty lines
+            elif line.startswith("Funding Rate Statistics:"):
+                current_section = "Funding Rate Statistics"
+                continue
+            elif line.startswith("High Rates Analysis"):
+                current_section = "High Rates Analysis"
+                continue
+            elif line.startswith("Top 10 Highest Rates"):
+                current_section = "Top Rates"
+                continue
+            
+            # For regular metrics lines
+            if ":" in line and not line.startswith("Top "):
+                parts = line.split(":", 1)
+                metric = parts[0].strip()
+                value = parts[1].strip()
+                data.append({
+                    "Section": current_section,
+                    "Metric": metric,
+                    "Value": value
+                })
+            # For top rates lines (formatted like "1. 2025-01-18 02:00:00.030000: 0.5873%")
+            elif current_section == "Top Rates" and "." in line:
+                parts = line.split(".", 1)
+                rank = parts[0].strip()
+                value_part = parts[1].strip()
+                data.append({
+                    "Section": current_section,
+                    "Metric": f"Rank {rank}",
+                    "Value": value_part
+                })
+        
+        # Create a DataFrame and save to CSV
+        df = pd.DataFrame(data)
+        filename = f"{token.lower()}_{time_range}_terminal_stats.csv"
+        df.to_csv(filename, index=False)
+        print(f"Saved terminal output to {filename}")
+
+def main():
+    analyzer = TrumpHPOSAnalyzer()
+    
+    print("Starting detailed analysis of TRUMP and HPOS tokens...")
+    
+    # Collect stats for all tokens
+    all_time_stats = []
+    last_500_stats = []
+    
+    for token in analyzer.tokens:
+        full_history, last_500 = analyzer.analyze_token(token)
+        if full_history and last_500:  # Only add if we got valid stats
+            all_time_stats.append(full_history)
+            last_500_stats.append(last_500)
+    
+    # Create consolidated CSV files
+    if all_time_stats:
+        pd.DataFrame(all_time_stats).to_csv('all_tokens_full_history_stats.csv', index=False)
+    if last_500_stats:
+        pd.DataFrame(last_500_stats).to_csv('all_tokens_last_500_stats.csv', index=False)
+    
+    print("\nAnalysis complete! Check the generated PNG files and consolidated CSV files:")
+    print("- all_tokens_full_history_stats.csv")
+    print("- all_tokens_last_500_stats.csv")
+
+if __name__ == "__main__":
+    main() 
